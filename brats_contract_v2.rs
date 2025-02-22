@@ -3,8 +3,8 @@
 
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program;
-use anchor_spl::token::{self, Mint, MintTo, Token, TokenAccount, Transfer};
-use solana_program::system_instruction;
+use anchor_lang::solana_program::system_instruction;
+use anchor_spl::token::{self, Burn, Mint, MintTo, Token, TokenAccount, Transfer};
 use std::str::FromStr;
 
 declare_id!("BxaA8XGHQG2z5X1J4JLcPVVdKBpzK3qSt1Bhk3YktW3s"); // Replace with your program ID
@@ -57,6 +57,21 @@ pub struct StakeInfo {
     pub last_claim_time: i64, // Timestamp of last reward claim
 }
 
+/// This account holds the presale stage data. There are 8 stages.
+/// The `price` is stored as a fixed-point value with 8 decimals (e.g. 0.00021 is stored as 21000).
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
+pub struct PresaleStage {
+    pub stage: u8,
+    pub price: u64,
+    pub tokens_sold: u64,
+    pub total_raised: u64,
+}
+
+#[account]
+pub struct PresaleStageInfo {
+    pub stages: [PresaleStage; 8],
+}
+
 //
 // PROGRAM
 //
@@ -64,7 +79,7 @@ pub struct StakeInfo {
 pub mod brats_contract {
     use super::*;
 
-    /// Initialize the presale state. Sets the owner (admin) to the devnet wallet.
+    /// Initialize the presale state. Sets the admin to the specified devnet wallet.
     pub fn initialize_token(ctx: Context<InitializeToken>) -> ProgramResult {
         let presale_state = &mut ctx.accounts.presale_state;
         presale_state.is_presale_active = true;
@@ -92,6 +107,7 @@ pub mod brats_contract {
     }
 
     /// End the presale and mark the launch time.
+    /// After this, staking is disabled.
     pub fn end_presale(ctx: Context<EndPresale>) -> ProgramResult {
         let presale_state = &mut ctx.accounts.presale_state;
         require!(presale_state.is_presale_active, ErrorCode::PresaleAlreadyEnded);
@@ -109,7 +125,6 @@ pub mod brats_contract {
     }
 
     /// Accept payment in either SOL or our custom SPL token.
-    ///
     /// A flat fee of 3 (units) is deducted and sent to the fee wallet.
     /// The remaining amount is transferred to the treasury.
     pub fn accept_payment(
@@ -196,9 +211,7 @@ pub mod brats_contract {
     }
 
     /// Deposit SOL into the treasury.
-    ///
-    /// This is a dedicated deposit instruction for SOL. It transfers the specified amount of SOL
-    /// from the payer to the treasury SOL account.
+    /// This is a dedicated deposit instruction for SOL.
     pub fn deposit_sol(ctx: Context<DepositSol>, amount: u64) -> ProgramResult {
         let ix = system_instruction::transfer(
             &ctx.accounts.payer.key,
@@ -216,14 +229,18 @@ pub mod brats_contract {
         Ok(())
     }
 
-    /// Stake tokens after the presale has ended.
-    ///
-    /// Transfers tokens from the user’s account to the staking pool and records the stake.
+    /// Stake tokens during the presale.
+    /// Staking is allowed only while the presale is active and if rewards are available.
     pub fn stake_tokens(ctx: Context<StakeTokens>, amount: u64) -> ProgramResult {
-        // Ensure that staking only happens after the presale has ended.
+        // Allow staking only if presale is active.
         require!(
-            !ctx.accounts.presale_state.is_presale_active,
-            ErrorCode::PresaleNotEnded
+            ctx.accounts.presale_state.is_presale_active,
+            ErrorCode::StakingClosed
+        );
+        // Also, ensure the reward pool is not empty.
+        require!(
+            ctx.accounts.global_state.reward_pool > 0,
+            ErrorCode::StakingRewardsExhausted
         );
         require!(amount > 0, ErrorCode::InvalidAmount);
 
@@ -244,10 +261,10 @@ pub mod brats_contract {
     }
 
     /// Unstake tokens.
-    ///
     /// If the full staking duration has been met, the full stake is returned.
-    /// Otherwise (after the early unstake period), an early-unstake penalty is applied:
-    /// the user receives (100 - penalty)% of their staked tokens while the penalty portion is burned.
+    /// Otherwise, if early unstaking is used (allowed only after 7 days from launch),
+    /// a 20% penalty is applied: the user receives (100 - penalty)% of their staked tokens
+    /// and the penalty portion is burned.
     pub fn unstake_tokens(ctx: Context<UnstakeTokens>) -> ProgramResult {
         let stake_info = &mut ctx.accounts.stake_info;
         let global_state = &mut ctx.accounts.global_state;
@@ -288,7 +305,6 @@ pub mod brats_contract {
     }
 
     /// Lock liquidity by transferring liquidity tokens to a vault.
-    ///
     /// This function should be called (by admin or automatically) while liquidity is still locked.
     pub fn lock_liquidity(ctx: Context<LockLiquidity>) -> ProgramResult {
         let clock = Clock::get()?;
@@ -309,7 +325,6 @@ pub mod brats_contract {
     }
 
     /// Claim staking rewards.
-    ///
     /// Rewards are calculated based on the staked amount, the time since the last claim,
     /// and the current APY stored in GlobalState.
     pub fn claim_rewards(ctx: Context<ClaimRewards>) -> ProgramResult {
@@ -354,16 +369,6 @@ pub mod brats_contract {
         Ok(reward_amount)
     }
 
-    /// Mint new tokens. (Admin only)
-    pub fn mint_tokens(ctx: Context<MintTokens>, amount: u64) -> ProgramResult {
-        require!(
-            ctx.accounts.admin.key() == ctx.accounts.presale_state.admin,
-            ErrorCode::Unauthorized
-        );
-        token::mint_to(ctx.accounts.mint_to_context(), amount)?;
-        Ok(())
-    }
-
     /// Burn tokens from a source account. (Admin only)
     pub fn burn_tokens(ctx: Context<BurnTokens>, amount: u64) -> ProgramResult {
         require!(
@@ -405,6 +410,69 @@ pub mod brats_contract {
         global_state.transaction_fee_percent = new_fee_percent;
         Ok(())
     }
+
+    /// Allow the admin to withdraw funds from the treasury SOL account during the presale.
+    pub fn withdraw_funds(ctx: Context<WithdrawFunds>, amount: u64) -> ProgramResult {
+        // Only allow withdrawal while presale is active.
+        require!(
+            ctx.accounts.presale_state.is_presale_active,
+            ErrorCode::WithdrawalNotAllowedAfterPresale
+        );
+        let ix = system_instruction::transfer(
+            ctx.accounts.treasury_sol_account.key,
+            ctx.accounts.admin.key,
+            amount,
+        );
+        solana_program::program::invoke(
+            &ix,
+            &[
+                ctx.accounts.treasury_sol_account.clone(),
+                ctx.accounts.admin.to_account_info(),
+                ctx.accounts.system_program.to_account_info(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Initialize the presale stage information with default stages.
+    pub fn initialize_presale_stages(ctx: Context<InitializePresaleStages>) -> ProgramResult {
+        let presale_stage_info = &mut ctx.accounts.presale_stage_info;
+        presale_stage_info.stages = [
+            // Prices are stored with 8 decimals (e.g. 0.00021 -> 21000)
+            PresaleStage { stage: 1, price: 21000, tokens_sold: 2_500_000_000, total_raised: 525_000 },
+            PresaleStage { stage: 2, price: 25000, tokens_sold: 2_500_000_000, total_raised: 625_000 },
+            PresaleStage { stage: 3, price: 29000, tokens_sold: 2_500_000_000, total_raised: 725_000 },
+            PresaleStage { stage: 4, price: 33000, tokens_sold: 2_500_000_000, total_raised: 825_000 },
+            PresaleStage { stage: 5, price: 37000, tokens_sold: 2_500_000_000, total_raised: 925_000 },
+            PresaleStage { stage: 6, price: 41000, tokens_sold: 2_500_000_000, total_raised: 1_025_000 },
+            PresaleStage { stage: 7, price: 45000, tokens_sold: 2_500_000_000, total_raised: 1_125_000 },
+            PresaleStage { stage: 8, price: 49000, tokens_sold: 2_500_000_000, total_raised: 1_225_000 },
+        ];
+        Ok(())
+    }
+
+    /// Update a specific presale stage (Admin only).
+    /// `stage_index` is 0-based (i.e. 0 for Stage 1, 1 for Stage 2, etc.)
+    pub fn update_presale_stage(
+        ctx: Context<UpdatePresaleStage>,
+        stage_index: u8,
+        price: u64,
+        tokens_sold: u64,
+        total_raised: u64,
+    ) -> ProgramResult {
+        let presale_stage_info = &mut ctx.accounts.presale_stage_info;
+        require!(
+            (stage_index as usize) < presale_stage_info.stages.len(),
+            ErrorCode::InvalidStageIndex
+        );
+        presale_stage_info.stages[stage_index as usize] = PresaleStage {
+            stage: stage_index + 1,
+            price,
+            tokens_sold,
+            total_raised,
+        };
+        Ok(())
+    }
 }
 
 //
@@ -412,7 +480,7 @@ pub mod brats_contract {
 //
 #[error]
 pub enum ErrorCode {
-    #[msg("Presale has not ended yet. Staking is not allowed.")]
+    #[msg("Presale has not ended yet. Staking is only allowed during the presale.")]
     PresaleNotEnded,
     #[msg("Presale already ended.")]
     PresaleAlreadyEnded,
@@ -434,6 +502,14 @@ pub enum ErrorCode {
     Unauthorized,
     #[msg("Fee wallet provided is invalid.")]
     InvalidFeeWallet,
+    #[msg("Staking is only allowed during the presale.")]
+    StakingClosed,
+    #[msg("Staking rewards pool is exhausted.")]
+    StakingRewardsExhausted,
+    #[msg("Withdrawal allowed only during presale.")]
+    WithdrawalNotAllowedAfterPresale,
+    #[msg("Invalid presale stage index.")]
+    InvalidStageIndex,
 }
 
 //
@@ -607,8 +683,8 @@ impl<'info> UnstakeTokens<'info> {
     /// Returns a CPI context for burning tokens from the staking pool (penalty).
     pub fn early_unstake_burn_context(
         &self,
-    ) -> CpiContext<'_, '_, '_, 'info, anchor_spl::token::Burn<'info>> {
-        let cpi_accounts = anchor_spl::token::Burn {
+    ) -> CpiContext<'_, '_, '_, 'info, Burn<'info>> {
+        let cpi_accounts = Burn {
             mint: self.mint.to_account_info(),
             to: self.staking_pool_token_account.to_account_info(),
             authority: self.payer.to_account_info(),
@@ -690,33 +766,6 @@ impl<'info> LockLiquidity<'info> {
     }
 }
 
-// ---------- MintTokens ----------
-#[derive(Accounts)]
-pub struct MintTokens<'info> {
-    #[account(mut)]
-    pub presale_state: Account<'info, PresaleState>,
-    #[account(mut)]
-    pub mint: Account<'info, Mint>,
-    /// The destination token account to receive minted tokens.
-    #[account(mut)]
-    pub destination: Account<'info, TokenAccount>,
-    pub admin: Signer<'info>,
-    pub token_program: Program<'info, Token>,
-}
-
-impl<'info> MintTokens<'info> {
-    pub fn mint_to_context(
-        &self,
-    ) -> CpiContext<'_, '_, '_, 'info, MintTo<'info>> {
-        let cpi_accounts = MintTo {
-            mint: self.mint.to_account_info(),
-            to: self.destination.to_account_info(),
-            authority: self.admin.to_account_info(),
-        };
-        CpiContext::new(self.token_program.to_account_info(), cpi_accounts)
-    }
-}
-
 // ---------- BurnTokens ----------
 #[derive(Accounts)]
 pub struct BurnTokens<'info> {
@@ -734,8 +783,8 @@ pub struct BurnTokens<'info> {
 impl<'info> BurnTokens<'info> {
     pub fn burn_context(
         &self,
-    ) -> CpiContext<'_, '_, '_, 'info, anchor_spl::token::Burn<'info>> {
-        let cpi_accounts = anchor_spl::token::Burn {
+    ) -> CpiContext<'_, '_, '_, 'info, Burn<'info>> {
+        let cpi_accounts = Burn {
             mint: self.mint.to_account_info(),
             to: self.source.to_account_info(),
             authority: self.admin.to_account_info(),
@@ -781,5 +830,36 @@ pub struct UpdateParameters<'info> {
     pub presale_state: Account<'info, PresaleState>,
     #[account(mut)]
     pub global_state: Account<'info, GlobalState>,
+    pub admin: Signer<'info>,
+}
+
+// ---------- WithdrawFunds ----------
+#[derive(Accounts)]
+pub struct WithdrawFunds<'info> {
+    #[account(mut)]
+    pub presale_state: Account<'info, PresaleState>,
+    /// CHECK: Treasury SOL account from which funds will be withdrawn.
+    #[account(mut)]
+    pub treasury_sol_account: AccountInfo<'info>,
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+// ---------- InitializePresaleStages ----------
+#[derive(Accounts)]
+pub struct InitializePresaleStages<'info> {
+    #[account(init, payer = payer, space = 8 + std::mem::size_of::<PresaleStageInfo>())]
+    pub presale_stage_info: Account<'info, PresaleStageInfo>,
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+// ---------- UpdatePresaleStage ----------
+#[derive(Accounts)]
+pub struct UpdatePresaleStage<'info> {
+    #[account(mut)]
+    pub presale_stage_info: Account<'info, PresaleStageInfo>,
     pub admin: Signer<'info>,
 }
